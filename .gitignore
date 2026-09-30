@@ -1,0 +1,13 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+profiles/
+runs/
+*.mp4
+!demo/*.mp4
+dist/
+*.egg-info/
+.DS_Store
