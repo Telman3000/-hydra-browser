@@ -17,6 +17,7 @@ from typing import Any
 
 from playwright.sync_api import sync_playwright
 
+from ..browser.layout import viewport_for, window_args, worker_window_rect
 from ..browser.session import BrowserSession, _INIT_SCRIPT, resolve_browser_channel
 from ..config import AgentConfig, SafetyConfig
 from ..llm import LLM, Usage, text_of
@@ -50,6 +51,8 @@ class _EphemeralSession:
     default_timeout_ms: int = 12_000
     video_dir: Path | None = None
     slot: int = 0
+    slots: int = 1
+    layout: str = "default"
 
     _pw: Any = field(default=None, init=False, repr=False)
     _browser: Any = field(default=None, init=False, repr=False)
@@ -64,17 +67,14 @@ class _EphemeralSession:
         from ..browser.session import resolve_browser_channel
 
         self._pw = sync_playwright().start()
+        rect = worker_window_rect(self.layout, self.slot, self.slots)
         try:
             launch_kwargs: dict[str, Any] = {
                 "headless": self.headless,
                 "slow_mo": self.slow_mo_ms,
-                "args": [
-                    "--disable-blink-features=AutomationControlled",
-                    # Cascade worker windows so they are all visible next to the main one.
-                    f"--window-position={60 + self.slot * 360},{80 + self.slot * 70}",
-                    "--window-size=1100,760",
-                ],
+                "args": window_args(rect),
                 "ignore_default_args": ["--enable-automation"],
+                "chromium_sandbox": True,
             }
             channel = resolve_browser_channel(self._pw, headless=self.headless)
             if channel:
@@ -83,11 +83,12 @@ class _EphemeralSession:
             ctx_kwargs: dict[str, Any] = {"no_viewport": True}
             if self.video_dir:
                 Path(self.video_dir).mkdir(parents=True, exist_ok=True)
+                viewport = viewport_for(rect if self.layout == "split" else None, (1280, 800))
                 ctx_kwargs.update(
                     no_viewport=False,
-                    viewport={"width": 1280, "height": 800},
+                    viewport=viewport,
                     record_video_dir=str(self.video_dir),
-                    record_video_size={"width": 1280, "height": 800},
+                    record_video_size=viewport,
                 )
             if self.storage_state_path and Path(self.storage_state_path).exists():
                 ctx_kwargs["storage_state"] = str(self.storage_state_path)
@@ -97,6 +98,8 @@ class _EphemeralSession:
             self._context.on("page", self._on_new_page)
             self.page = self._context.new_page()
             self._wire_page(self.page)
+            # Windows opened by a background process may land behind others.
+            self.page.bring_to_front()
             if start_url:
                 self.goto(start_url)
         except Exception:
@@ -273,6 +276,33 @@ def _worker_confirm(tool: str, args: dict[str, Any], verdict: Verdict) -> bool:
     return True
 
 
+def _salvage_report(llm: LLM, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> str:
+    """Out of steps without a report: one last call to write up what was found."""
+    if messages and messages[-1]["role"] == "assistant":
+        # Its tool calls were never answered; a dangling tool_use is rejected by the API.
+        messages = messages[:-1]
+    ask = {
+        "role": "user",
+        "content": [
+            {
+                "type": "text",
+                "text": "You are out of steps. Call finish now with everything you found "
+                "so far, and say what is missing.",
+            }
+        ],
+    }
+    try:
+        response = llm.create(
+            system=WORKER_SYSTEM, messages=[*messages, ask], tools=tools, max_tokens=2_000
+        )
+    except Exception:  # noqa: BLE001
+        return ""
+    for block in response.content:
+        if block.type == "tool_use" and block.name == "finish":
+            return str(dict(block.input).get("report") or "")
+    return text_of(response.content)
+
+
 def run_worker_agent(
     goal: str,
     start_url: str | None,
@@ -282,6 +312,7 @@ def run_worker_agent(
     worker_id: int,
     console: AgentConsole | None = None,
     trace: Trace | None = None,
+    slots: int = 1,
 ) -> WorkerResult:
     """Run an action-capable worker in the calling thread with its own Playwright."""
     usage = Usage()
@@ -291,7 +322,9 @@ def run_worker_agent(
         slow_mo_ms=cfg.browser.slow_mo_ms,
         storage_state_path=Path(storage_state_path) if storage_state_path else None,
         video_dir=(run_dir / "video" / f"w{worker_id}") if cfg.browser.record_video else None,
-        slot=worker_id - 1,
+        slot=(worker_id - 1) % max(slots, 1),
+        slots=slots,
+        layout=cfg.browser.layout,
     )
     prefix = WORKER_PREFIX.format(wid=worker_id)
     # Workers have no human: ask-mode + callback that auto-refuses medium/high.
@@ -309,8 +342,15 @@ def run_worker_agent(
         session.start()
         if trace and session.video_path():
             trace.write("worker_video", worker_id=worker_id, video=session.video_path())
+        start_note = ""
         if start_url:
-            session.goto(start_url)
+            try:
+                session.goto(start_url, timeout_ms=30_000)
+            except Exception as exc:  # noqa: BLE001
+                start_note = (
+                    f"\nOpening {start_url} failed ({str(exc).splitlines()[0]}). "
+                    "Retry with browser_navigate or work around it."
+                )
         box = Toolbox(
             session,  # type: ignore[arg-type]
             cfg,
@@ -329,7 +369,7 @@ def run_worker_agent(
                         "type": "text",
                         "text": (
                             f'<worker id="{worker_id}" url="{page.url}"/>\n'
-                            f"<goal>\n{goal}\n</goal>"
+                            f"<goal>\n{goal}\n</goal>{start_note}"
                         ),
                     }
                 ],
@@ -354,7 +394,8 @@ def run_worker_agent(
             report = text_of(response.content) or report
 
             if not tool_uses:
-                status = "partial"
+                # A full answer given as plain text instead of via finish still counts.
+                status = "completed" if len(report.strip()) >= 200 else "partial"
                 break
 
             results = []
@@ -406,6 +447,8 @@ def run_worker_agent(
                     }
                 )
 
+        if not report.strip():
+            report = _salvage_report(llm, messages, tools)
         return WorkerResult(
             worker_id=worker_id,
             status=status,
@@ -458,6 +501,7 @@ def run_parallel_workers(
             worker_id=idx,
             console=console,
             trace=trace,
+            slots=max_workers,
         )
         if trace:
             trace.write(

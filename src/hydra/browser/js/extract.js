@@ -9,6 +9,11 @@
  * Nothing here is site-specific: roles and names are derived from HTML/ARIA
  * semantics only.
  */
+// The browser is the user's own, shared with them: report it as a regular one.
+// (Chrome's --disable-blink-features flag does the same but pins a warning bar.)
+try {
+  Object.defineProperty(Navigator.prototype, 'webdriver', { get: () => false, configurable: true });
+} catch (e) { /* already defined */ }
 (() => {
   if (window.__agent && window.__agent.version === 3) return;
 
@@ -195,7 +200,12 @@
     try { u = new URL(raw, location.href); } catch (e) { return ''; }
     if (u.protocol !== 'http:' && u.protocol !== 'https:') return '';
     const same = u.host === location.host;
-    return clip((same ? '' : u.host) + u.pathname + u.search, 90);
+    let path = u.pathname, query = u.search;
+    try { path = decodeURI(path); query = decodeURIComponent(query); } catch (e) { /* keep raw */ }
+    // Short queries often identify the page (?id=5); long ones are tracking and
+    // search echoes that only bury the address, so they collapse to "?…".
+    if (query.length > 40) query = '?…';
+    return clip((same ? '' : u.host) + path + query, 120);
   }
 
   function isScrollable(el, style) {
@@ -355,7 +365,8 @@
         (el.getAttribute('aria-label') || '') + ' ' +
         (el.getAttribute('placeholder') || '') + ' ' +
         (el.getAttribute('title') || '') + ' ' +
-        (el.getAttribute('value') || '')).toLowerCase();
+        (el.getAttribute('value') || '') + ' ' +
+        (el.tagName === 'A' ? shortHref(el) : '')).toLowerCase();
       if (hay.includes(q)) {
         const role = roleOf(el);
         out.push({ ref, role, name: accessibleName(el, role), href: role === 'link' ? shortHref(el) : '', context: clip(el.parentElement ? el.parentElement.innerText : '', 160) });
@@ -376,6 +387,8 @@
       if (!rect.width && !rect.height) continue;
       // Register a ref on the nearest actionable ancestor so the match is usable.
       const actionable = el.closest('a,button,input,select,textarea,[role],[onclick],[tabindex]') || el;
+      if (seen.has(actionable)) continue;
+      seen.add(actionable);
       let ref = window.__agent.byEl.get(actionable);
       if (!ref) {
         ref = 'e' + (++window.__agent.findSeq) + 'f';

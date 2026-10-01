@@ -20,6 +20,8 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
+from .layout import main_window_rect, viewport_for, window_args
+
 log = logging.getLogger(__name__)
 
 _INIT_SCRIPT = Path(__file__).parent / "js" / "extract.js"
@@ -71,6 +73,7 @@ class BrowserSession:
     video_dir: Path | None = None
     dialog_policy: str = "accept"
     default_timeout_ms: int = 12_000
+    layout: str = "default"
 
     _pw: Any = field(default=None, init=False, repr=False)
     _context: BrowserContext | None = field(default=None, init=False, repr=False)
@@ -84,23 +87,24 @@ class BrowserSession:
         self._pw = sync_playwright().start()
         try:
             self.user_data_dir.mkdir(parents=True, exist_ok=True)
+            rect = main_window_rect(self.layout)
             launch_kwargs: dict[str, Any] = {
                 "user_data_dir": str(self.user_data_dir),
                 "headless": self.headless,
                 "slow_mo": self.slow_mo_ms,
                 "no_viewport": True,
-                "args": [
-                    "--disable-blink-features=AutomationControlled",
-                    "--start-maximized",
-                ],
+                "args": window_args(rect),
                 "ignore_default_args": ["--enable-automation"],
+                # Without it Playwright passes --no-sandbox, and Chrome pins a warning bar.
+                "chromium_sandbox": True,
             }
             if self.video_dir:
                 self.video_dir.mkdir(parents=True, exist_ok=True)
+                viewport = viewport_for(rect, (1440, 900))
                 launch_kwargs["record_video_dir"] = str(self.video_dir)
-                launch_kwargs["record_video_size"] = {"width": 1440, "height": 900}
+                launch_kwargs["record_video_size"] = viewport
                 launch_kwargs["no_viewport"] = False
-                launch_kwargs["viewport"] = {"width": 1440, "height": 900}
+                launch_kwargs["viewport"] = viewport
 
             channel = resolve_browser_channel(self._pw, headless=self.headless)
             if channel:
@@ -134,6 +138,17 @@ class BrowserSession:
                 self._pw.stop()
         except Exception:  # noqa: BLE001
             pass
+
+    def set_window_state(self, state: str) -> None:
+        """minimized | normal — best effort, via CDP (Chromium only)."""
+        try:
+            page = self.active_page()
+            cdp = self.context.new_cdp_session(page)
+            window = cdp.send("Browser.getWindowForTarget")["windowId"]
+            cdp.send("Browser.setWindowBounds", {"windowId": window, "bounds": {"windowState": state}})
+            cdp.detach()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("window state %s failed: %s", state, exc)
 
     def export_storage_state(self, path: Path | str) -> Path:
         """Export cookies/localStorage so parallel workers can inherit the session."""

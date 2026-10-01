@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from rich.console import Console
@@ -13,6 +14,40 @@ from rich.prompt import Prompt
 from rich.text import Text
 
 RISK_STYLE = {"none": "green", "low": "green", "medium": "yellow", "high": "bold red"}
+
+# Below this width a multi-column markdown table squeezes into one word per line.
+NARROW_TABLE_COLS = 120
+
+
+def _cells(row: str) -> list[str]:
+    return [c.strip() for c in row.strip().strip("|").split("|")]
+
+
+def tables_as_lists(markdown: str) -> str:
+    """Rewrite markdown tables as one bullet per row, readable in a narrow terminal."""
+    out: list[str] = []
+    lines = markdown.splitlines()
+    i = 0
+    while i < len(lines):
+        is_table = (
+            i + 1 < len(lines)
+            and lines[i].lstrip().startswith("|")
+            and re.match(r"^\s*\|?\s*:?-{2,}", lines[i + 1])
+        )
+        if not is_table:
+            out.append(lines[i])
+            i += 1
+            continue
+        header = _cells(lines[i])
+        i += 2
+        while i < len(lines) and lines[i].lstrip().startswith("|"):
+            cells = _cells(lines[i])
+            first, rest = (cells[0] if cells else ""), cells[1:]
+            pairs = [f"{h}: {v}" for h, v in zip(header[1:], rest) if v]
+            out.append(f"- **{first}** — " + "; ".join(pairs))
+            i += 1
+        out.append("")
+    return "\n".join(out)
 
 
 class AgentConsole:
@@ -60,6 +95,12 @@ class AgentConsole:
         if self.quiet:
             return
         body = text if isinstance(text, str) else "<non-text result>"
+        # The trust fence is for the model; on screen it only pushes content away.
+        body = "\n".join(
+            line
+            for line in body.splitlines()
+            if not line.lstrip().startswith(("<page_content", "</page_content"))
+        )
         shown = body.strip().splitlines()[:lines]
         style = "red" if is_error else "grey58"
         for line in shown:
@@ -79,9 +120,10 @@ class AgentConsole:
 
     def report(self, report: str, status: str) -> None:
         colour = {"completed": "green", "partial": "yellow", "failed": "red"}.get(status, "cyan")
-        self.console.print(
-            Panel(Markdown(report or "(no report)"), title=f"result: {status}", border_style=colour)
-        )
+        text = report or "(no report)"
+        if self.console.width < NARROW_TABLE_COLS:
+            text = tables_as_lists(text)
+        self.console.print(Panel(Markdown(text), title=f"result: {status}", border_style=colour))
 
     def usage(self, usage: Any, steps: int, compactions: int, pruned: int) -> None:
         self.console.print(

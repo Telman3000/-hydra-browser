@@ -90,6 +90,28 @@ def test_agent_completes_a_delete_task_through_the_gate(mail, monkeypatch):
     assert "Крипто-Доход" not in mail.active_page().inner_text("body")
 
 
+def test_running_out_of_steps_still_yields_a_report(mail, monkeypatch):
+    def look(_m):
+        return [Block("tool_use", id="s", name="browser_snapshot", input={})]
+
+    def wrap_up(messages):
+        assert "step budget is spent" in str(messages[-1]["content"])
+        return [
+            Block(
+                "tool_use",
+                id="f",
+                name="finish",
+                input={"report": "Нашёл 5 писем, спам не успел удалить."},
+            )
+        ]
+
+    agent = build_agent(mail, monkeypatch, [look, look, wrap_up])
+    agent.cfg.max_steps = 2
+    result = agent.run("Удали спам")
+    assert result.status == "partial"
+    assert result.report == "Нашёл 5 писем, спам не успел удалить."
+
+
 def test_a_refused_gate_stops_the_action_and_tells_the_agent_why(mail, monkeypatch):
     def step1(_m):
         return [Block("tool_use", id="1", name="browser_snapshot", input={})]

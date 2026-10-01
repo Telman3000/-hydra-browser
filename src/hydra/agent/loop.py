@@ -41,6 +41,17 @@ with a report for the user. If it is not, continue working. If you are blocked
 on something only the user can supply, call `ask_user`.
 </system-reminder>"""
 
+PROGRESS_NUDGE = """<system-reminder>
+{n} steps used. Re-read the task and check: what is already done, and what is
+the shortest path to the rest? Do not spend steps polishing optional details at
+the cost of the main goal. If independent items remain, delegate them.
+</system-reminder>"""
+
+OUT_OF_STEPS = """<system-reminder>
+The step budget is spent. Call `finish` now: report everything you found so far
+and say plainly what is missing.
+</system-reminder>"""
+
 BUDGET_NUDGE = """<system-reminder>
 Only {n} steps remain in this run. Wrap up: secure what you have achieved and
 call `finish` with an honest report of what is done and what is not.
@@ -141,14 +152,22 @@ class AgentLoop:
         if self.trace:
             self.trace.write("parallel_delegate", tasks=tasks)
 
-        results = run_parallel_workers(
-            tasks=tasks,
-            storage_state_path=state_path,
-            cfg=self.cfg,
-            console=self.console,
-            trace=self.trace,
-            run_dir=(self.trace.dir / "workers") if self.trace else self.cfg.runs_dir / "workers",
-        )
+        # In the split layout workers tile over the main window's area; step it aside.
+        split = self.cfg.browser.layout == "split"
+        if split:
+            self.session.set_window_state("minimized")
+        try:
+            results = run_parallel_workers(
+                tasks=tasks,
+                storage_state_path=state_path,
+                cfg=self.cfg,
+                console=self.console,
+                trace=self.trace,
+                run_dir=(self.trace.dir / "workers") if self.trace else self.cfg.runs_dir / "workers",
+            )
+        finally:
+            if split:
+                self.session.set_window_state("normal")
         return merge_worker_reports(results)
 
     def system_blocks(self) -> Any:
@@ -160,7 +179,9 @@ class AgentLoop:
         page = self.session.active_page()
         self.convo.add_user_text(
             f'<environment browser="chromium" url="{page.url}" tabs="{len(self.session.pages)}"/>\n'
-            f"<task>\n{task}\n</task>"
+            f"<task>\n{task}\n</task>\n"
+            "Write your messages, worker goals and the finish report in the language "
+            "this task is written in."
         )
         if self.trace:
             self.trace.write("task", task=task, url=page.url, model=self.cfg.model.main)
@@ -176,6 +197,8 @@ class AgentLoop:
 
             if step == self.cfg.max_steps - 2:
                 self.convo.add_user_text(BUDGET_NUDGE.format(n=3))
+            elif step > 1 and step % 12 == 1:
+                self.convo.add_user_text(PROGRESS_NUDGE.format(n=step - 1))
 
             try:
                 response = self._call_model(system, tools)
@@ -229,9 +252,11 @@ class AgentLoop:
             self.convo.add_tool_results(results)
             self._inject_nudges(tool_uses)
 
+        report = self._final_report(system, tools)
         return RunResult(
             "partial",
-            "Step budget exhausted before the task was finished. "
+            report
+            or "Step budget exhausted before the task was finished. "
             f"Notes gathered: {json.dumps(self.convo.notes, ensure_ascii=False)}",
             self.cfg.max_steps,
             self.usage,
@@ -267,6 +292,21 @@ class AgentLoop:
                 time.sleep(wait)
                 delay *= 2
         raise RuntimeError("unreachable")
+
+    def _final_report(self, system: Any, tools: list[dict[str, Any]]) -> str:
+        """Out of steps: one more model call, only to write up what was achieved."""
+        messages = self.convo.messages
+        if messages and messages[-1]["role"] == "assistant":
+            return ""
+        self.convo.add_user_text(OUT_OF_STEPS)
+        try:
+            response = self._call_model(system, tools)
+        except Exception:  # noqa: BLE001
+            return ""
+        for block in response.content:
+            if block.type == "tool_use" and block.name == "finish":
+                return str(dict(block.input).get("report") or "")
+        return text_of(response.content)
 
     def _manage_context(self, task: str, tokens: int) -> None:
         pruned = self.convo.prune()

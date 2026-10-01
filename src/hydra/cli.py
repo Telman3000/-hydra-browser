@@ -43,6 +43,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--headless", action="store_true", help="Hide the browser.")
     p.add_argument("--slow-mo", type=int, help="Milliseconds to slow each browser action.")
     p.add_argument("--record-video", action="store_true", help="Record browser to runs/<ts>/video.")
+    p.add_argument(
+        "--layout",
+        choices=["default", "split"],
+        help="split: keep the left of the screen for the terminal, browsers on the right.",
+    )
     return p
 
 
@@ -71,6 +76,8 @@ def apply_args(cfg: AgentConfig, args: argparse.Namespace) -> AgentConfig:
         cfg.browser.record_video = True
     if args.url:
         cfg.browser.start_url = args.url
+    if args.layout:
+        cfg.browser.layout = args.layout
     return cfg
 
 
@@ -122,6 +129,7 @@ def main(argv: list[str] | None = None) -> int:
         headless=cfg.browser.headless,
         slow_mo_ms=cfg.browser.slow_mo_ms,
         video_dir=(trace.dir / "video") if cfg.browser.record_video else None,
+        layout=cfg.browser.layout,
     )
     session.on_page_event = lambda kind, path: trace.write(f"page_{kind}", video=path)
 

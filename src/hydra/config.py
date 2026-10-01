@@ -15,7 +15,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 # Playwright resolves its ffmpeg (needed for --record-video) under this path; a
 # project-local copy avoids depending on its CDN, which is often unreachable.
 _LOCAL_PW = PROJECT_ROOT / ".pw-browsers"
-if _LOCAL_PW.is_dir() and not os.getenv("PLAYWRIGHT_BROWSERS_PATH"):
+_SET_PW = os.getenv("PLAYWRIGHT_BROWSERS_PATH")
+if _LOCAL_PW.is_dir() and not (_SET_PW and any(Path(_SET_PW).glob("ffmpeg-*"))):
     os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(_LOCAL_PW)
 
 _PROVIDER = os.getenv("AGENT_PROVIDER", "anthropic").lower()
@@ -69,6 +70,7 @@ class BrowserConfig:
     start_url: str = os.getenv("AGENT_START_URL", "about:blank")
     slow_mo_ms: int = int(os.getenv("AGENT_SLOW_MO", "0"))
     record_video: bool = False
+    layout: str = os.getenv("AGENT_WINDOW_LAYOUT", "default")  # default | split
 
 
 @dataclass

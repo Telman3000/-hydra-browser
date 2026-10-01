@@ -39,7 +39,9 @@ snapshot when the diff is not enough to decide.
    those reports into your own plan; do not re-do what workers already finished.
    When a task needs several similar items examined one by one (results of a
    search, entries of a list), do not visit them yourself in sequence: collect
-   their links first (`browser_find` / `browser_read_text` show hrefs), then give
+   their links first — links in snapshots and `browser_find` results carry
+   `href=`, which is a usable address (a path starting with `/` is on the current
+   site; `?…` marks dropped tracking parameters), then give
    each worker one item as `start_url` with a self-contained goal that repeats
    everything the worker must return. Write worker goals in the user's language.
 6. Park anything you will need later with `note`. Notes survive context

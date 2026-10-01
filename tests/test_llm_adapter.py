@@ -28,6 +28,27 @@ def test_tool_call_without_arguments_converts():
     assert any(m["role"] == "tool" and m["tool_call_id"] == "call_1" for m in out)
 
 
+def test_worker_out_of_steps_still_reports():
+    from hydra.agent.workers import _salvage_report
+    from hydra.llm import SimpleMessage
+
+    seen = {}
+
+    class StubLLM:
+        def create(self, *, system, messages, tools, max_tokens):
+            seen["last_roles"] = [m["role"] for m in messages[-2:]]
+            return SimpleMessage(
+                content=[ContentBlock(type="tool_use", id="f", name="finish", input={"report": "found X"})]
+            )
+
+    history = [
+        {"role": "user", "content": [{"type": "text", "text": "goal"}]},
+        {"role": "assistant", "content": [ContentBlock(type="tool_use", id="a", name="note", input={})]},
+    ]
+    assert _salvage_report(StubLLM(), history, []) == "found X"
+    assert seen["last_roles"] == ["user", "user"]
+
+
 def test_dict_blocks_convert_too():
     messages = [
         {
