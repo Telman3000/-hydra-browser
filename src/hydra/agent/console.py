@@ -17,7 +17,8 @@ RISK_STYLE = {"none": "green", "low": "green", "medium": "yellow", "high": "bold
 
 class AgentConsole:
     def __init__(self, quiet: bool = False) -> None:
-        self.console = Console()
+        # Avoid cp1251 crashes on Windows when printing unicode (arrows, bullets).
+        self.console = Console(force_terminal=True, legacy_windows=False)
         self.quiet = quiet
 
     def rule(self, text: str) -> None:

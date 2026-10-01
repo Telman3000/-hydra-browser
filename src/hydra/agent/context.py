@@ -8,7 +8,7 @@ from typing import Any
 
 from ..browser.snapshot import fence_untrusted
 from ..config import ContextConfig
-from ..llm import LLM
+from ..llm import LLM, field_of
 
 PRUNED_TEMPLATE = (
     "[observation from step {step} was pruned to save context: {label}. "
@@ -177,15 +177,13 @@ class Conversation:
                 lines.append(f"[{role}] {content}")
                 continue
             for block in content or []:
-                btype = getattr(block, "type", None) or (
-                    block.get("type") if isinstance(block, dict) else None
-                )
+                btype = field_of(block, "type")
                 if btype == "text":
-                    text = getattr(block, "text", None) or block.get("text", "")
+                    text = field_of(block, "text") or ""
                     lines.append(f"[{role}] {text}")
                 elif btype == "tool_use":
-                    name = getattr(block, "name", None) or block.get("name")
-                    args = getattr(block, "input", None) or block.get("input")
+                    name = field_of(block, "name")
+                    args = field_of(block, "input") or {}
                     lines.append(
                         f"[tool_call] {name}({json.dumps(args, ensure_ascii=False)[:300]})"
                     )

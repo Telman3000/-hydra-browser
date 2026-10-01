@@ -12,15 +12,32 @@ load_dotenv(override=True)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
+# Playwright resolves its ffmpeg (needed for --record-video) under this path; a
+# project-local copy avoids depending on its CDN, which is often unreachable.
+_LOCAL_PW = PROJECT_ROOT / ".pw-browsers"
+if _LOCAL_PW.is_dir() and not os.getenv("PLAYWRIGHT_BROWSERS_PATH"):
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(_LOCAL_PW)
+
+_PROVIDER = os.getenv("AGENT_PROVIDER", "anthropic").lower()
+_DEFAULT_MAIN = (
+    os.getenv("AGENT_MODEL")
+    or ("gpt-4.1-mini" if _PROVIDER == "openai" else "claude-sonnet-4-5")
+)
+_DEFAULT_SMALL = (
+    os.getenv("AGENT_SMALL_MODEL")
+    or ("gpt-4o-mini" if _PROVIDER == "openai" else "claude-haiku-4-5")
+)
+
 
 @dataclass
 class ModelConfig:
-    main: str = os.getenv("AGENT_MODEL", "claude-sonnet-4-5")
-    small: str = os.getenv("AGENT_SMALL_MODEL", "claude-haiku-4-5")
+    provider: str = _PROVIDER  # anthropic | openai
+    main: str = _DEFAULT_MAIN
+    small: str = _DEFAULT_SMALL
     effort: str = os.getenv("AGENT_EFFORT", "high")
     max_tokens: int = 4_000
     profile: str = os.getenv("AGENT_API_PROFILE", "anthropic")
-    base_url: str | None = os.getenv("ANTHROPIC_BASE_URL") or None
+    base_url: str | None = os.getenv("ANTHROPIC_BASE_URL") or os.getenv("OPENAI_BASE_URL") or None
 
 
 @dataclass
@@ -60,7 +77,6 @@ class WorkerConfig:
 
     max_workers: int = int(os.getenv("AGENT_MAX_WORKERS", "3"))
     max_steps: int = int(os.getenv("AGENT_WORKER_MAX_STEPS", "20"))
-    # Workers inherit cookies from the orchestrator via storage_state export.
     inherit_session: bool = True
 
 

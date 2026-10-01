@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Compose a demo video: the terminal log next to the browser doing the work.
 
-Playwright records the browser itself; `runs/<ts>/trace.jsonl` carries every tool
-call with a timestamp. This script replays the trace as a terminal panel, frame
-by frame, and stacks it beside the browser recording.
+Run the agent with --record-video; Playwright records every browser (the main one
+and each parallel worker) and `runs/<ts>/trace.jsonl` carries every tool call with
+a timestamp. This script replays the trace as a terminal panel and stacks it beside
+the recordings. While parallel workers run, the browser side becomes a grid of the
+worker windows, so the parallelism is visible.
 
     python scripts/make_video.py runs/20260930-120000 -o demo.mp4
 """
@@ -27,6 +29,9 @@ FONT_PATHS = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
 ]
 BG = (14, 16, 22)
+BG_HEX = "0x0e1016"
+W, H = 1440, 900
+CELL_W, CELL_H = 720, 450
 COLOURS = {
     "task": (120, 210, 255),
     "tool": (240, 200, 90),
@@ -80,7 +85,11 @@ def trace_to_lines(path: Path, cols: int) -> list[tuple[float, str, str]]:
             args = json.dumps(record.get("args", {}), ensure_ascii=False)
             push(t, "tool", f"▸ {record['tool']}({args[:200]})")
         elif kind == "tool_result":
-            body = (record.get("content") or "").strip().splitlines()
+            body = [
+                line
+                for line in (record.get("content") or "").strip().splitlines()
+                if line.strip() and not line.lstrip().startswith(("<page_content", "</page_content"))
+            ]
             for line in body[:3]:
                 push(t, "error" if record.get("error") else "result", "  " + line[: cols - 4])
         elif kind == "gate":
@@ -110,6 +119,9 @@ def trace_to_lines(path: Path, cols: int) -> list[tuple[float, str, str]]:
                 "worker_start",
                 f"│ worker {record.get('worker_id')}: {record.get('goal', '')[:160]}",
             )
+        elif kind == "worker_tool":
+            args = json.dumps(record.get("args", {}), ensure_ascii=False)
+            push(t, "sub", f"│ w{record.get('worker_id')} ▸ {record['tool']}({args[:140]})")
         elif kind == "worker_done":
             push(
                 t,
@@ -117,6 +129,9 @@ def trace_to_lines(path: Path, cols: int) -> list[tuple[float, str, str]]:
                 f"│ worker {record.get('worker_id')} → {record.get('status')} "
                 f"({len(record.get('report', '') or '')} chars)",
             )
+        elif kind == "assistant":
+            for line in record.get("text", "").splitlines()[:4]:
+                push(t, "plain", line)
         elif kind == "ask_user":
             push(t, "note", f"? {record['question']}")
             push(t, "note", f"  you> {record['answer']}")
@@ -129,8 +144,8 @@ def trace_to_lines(path: Path, cols: int) -> list[tuple[float, str, str]]:
 _REMUXED: dict[str, Path] = {}
 
 
-def probe(path: Path) -> tuple[float, int, int]:
-    """Duration and size of a recording.
+def probe(path: Path) -> float:
+    """Duration of a recording, in seconds.
 
     A webm whose writer was interrupted carries no duration in its header, and
     Playwright leaves one behind whenever the browser goes away abruptly. Remuxing
@@ -141,19 +156,15 @@ def probe(path: Path) -> tuple[float, int, int]:
             "ffprobe",
             "-v",
             "error",
-            "-select_streams",
-            "v:0",
             "-show_entries",
-            "stream=width,height:format=duration",
+            "format=duration",
             "-of",
             "json",
             str(path),
         ],
         text=True,
     )
-    data = json.loads(out)
-    stream = data["streams"][0]
-    duration = data.get("format", {}).get("duration")
+    duration = json.loads(out).get("format", {}).get("duration")
     if duration in (None, "N/A"):
         fixed = _REMUXED.get(str(path))
         if fixed is None:
@@ -165,78 +176,148 @@ def probe(path: Path) -> tuple[float, int, int]:
             )
             _REMUXED[str(path)] = fixed
         return probe(fixed)
-    return float(duration), int(stream["width"]), int(stream["height"])
+    return float(duration)
 
 
-def build_timeline(records: list[dict], run_dir: Path) -> list[tuple[float, float, Path]]:
-    """Which tab was on screen when."""
-    tracks: dict[str, float] = {}
-    for rec in records:
-        if rec["kind"] == "page_opened" and rec.get("video"):
-            tracks.setdefault(rec["video"], rec["t"])
+def _resolve(video: str, *fallback_dirs: Path) -> Path | None:
+    path = Path(video)
+    if path.exists():
+        return path
+    for d in fallback_dirs:
+        for candidate in d.rglob(path.name):
+            return candidate
+    return None
 
+
+def main_marks(records: list[dict], run_dir: Path) -> list[tuple[float, Path, float]]:
+    """(trace time, recording, recording start) each time the visible main tab changes."""
+    opened: dict[str, float] = {}
     marks: list[tuple[float, str]] = []
     for rec in records:
         video = rec.get("video")
-        if not video:
+        if not video or rec["kind"] == "worker_video":
             continue
-        tracks.setdefault(video, rec["t"])
+        opened.setdefault(video, rec["t"])
         if not marks or marks[-1][1] != video:
             marks.append((rec["t"], video))
+    out = []
+    for t, video in marks:
+        path = _resolve(video, run_dir / "video")
+        if path:
+            out.append((t, path, opened[video]))
+    return out
 
-    if not marks:
-        return []
 
-    end = max(r["t"] for r in records) + 1.0
-    spans: list[tuple[float, float, Path]] = []
-    for i, (start, video) in enumerate(marks):
-        stop = marks[i + 1][0] if i + 1 < len(marks) else end
-        path = Path(video)
-        if not path.exists():
-            path = run_dir / "video" / path.name
-        if not path.exists() or stop - start < 0.4:
+def parallel_windows(records: list[dict], run_dir: Path) -> list[tuple[float, float, dict]]:
+    """Spans of trace time where workers ran, with each worker's recording."""
+    windows = []
+    for i, rec in enumerate(records):
+        if rec["kind"] != "parallel_delegate":
             continue
-        spans.append((start - tracks[video], stop - tracks[video], path))
-    return spans
+        start, end, videos = rec["t"], rec["t"], {}
+        for later in records[i + 1 :]:
+            if later["kind"] == "parallel_delegate":
+                break
+            if later["kind"] == "worker_video":
+                path = _resolve(later["video"], run_dir / "workers")
+                if path:
+                    videos[later["worker_id"]] = (later["t"], path)
+            elif later["kind"] == "worker_done":
+                end = max(end, later["t"])
+        if videos and end - start > 1:
+            windows.append((start, end, videos))
+    return windows
 
 
-def browser_stream(
-    spans: list[tuple[float, float, Path]], fps: int, speed: float, hold: float
-) -> tuple[list[str], str, float, str]:
-    """ffmpeg inputs and a filter that stitches the visible tabs into one track."""
-    durations: dict[Path, float] = {}
-    for _s, _e, path in spans:
-        if path not in durations:
-            durations[path] = probe(path)[0]
+class Graph:
+    """Collects ffmpeg inputs and filter chains; every clip gets its own input."""
 
-    files: list[Path] = []
-    for _s, _e, path in spans:
+    def __init__(self, fps: int) -> None:
+        self.fps = fps
+        self.inputs: list[str] = []
+        self.chains: list[str] = []
+        self._n = 0
+
+    def label(self, prefix: str) -> str:
+        self._n += 1
+        return f"{prefix}{self._n}"
+
+    def clip(self, path: Path, src_start: float, length: float, w: int, h: int) -> str:
+        """`length` seconds of `path` from `src_start`, frozen at either end if short."""
         actual = _REMUXED.get(str(path), path)
-        if actual not in files:
-            files.append(actual)
-
-    parts, labels, total = [], [], 0.0
-    for idx, (start, stop, path) in enumerate(spans):
-        duration = durations[path]
-        path = _REMUXED.get(str(path), path)
-        start, stop = max(0.0, start), min(stop, duration)
-        if stop - start < 0.4:
-            continue
-        stream = files.index(path) + 1  # input 0 is the terminal panel
-        parts.append(
-            f"[{stream}:v]trim=start={start:.2f}:end={stop:.2f},"
-            f"setpts=PTS-STARTPTS,fps={fps},scale=1440:900:force_original_aspect_ratio=decrease,"
-            f"pad=1440:900:(ow-iw)/2:(oh-ih)/2[t{idx}]"
+        duration = probe(path)
+        lead = max(0.0, -src_start)
+        start = min(max(0.0, src_start), max(0.0, duration - 0.2))
+        take = max(0.2, min(duration - start, length - lead))
+        self.inputs.append(str(actual))
+        idx = len(self.inputs)  # input 0 is the terminal panel
+        out = self.label("c")
+        self.chains.append(
+            f"[{idx}:v]trim=start={start:.2f}:duration={take:.2f},setpts=PTS-STARTPTS,"
+            f"fps={self.fps},scale={w}:{h}:force_original_aspect_ratio=decrease,"
+            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color={BG_HEX},setsar=1,"
+            f"tpad=start_mode=clone:start_duration={lead:.2f}:"
+            f"stop_mode=clone:stop_duration={length:.2f},trim=duration={length:.2f},"
+            f"setpts=PTS-STARTPTS[{out}]"
         )
-        labels.append(f"[t{idx}]")
-        total += stop - start
+        return out
 
-    joined = "".join(labels)
-    speed_filter = "" if speed == 1.0 else f",setpts=PTS/{speed}"
-    hold_filter = "" if hold <= 0 else f",tpad=stop_mode=clone:stop_duration={hold}"
-    filt = ";".join(parts) + f";{joined}concat=n={len(labels)}:v=1[cat]"
-    filt += f";[cat]fps={fps}{speed_filter}{hold_filter}[b]"
-    return [str(f) for f in files], filt, total, speed_filter
+    def blank(self, length: float, w: int, h: int) -> str:
+        out = self.label("k")
+        self.chains.append(
+            f"color=c={BG_HEX}:s={w}x{h}:r={self.fps}:d={length:.2f},setsar=1[{out}]"
+        )
+        return out
+
+    def grid(self, cells: list[str], length: float) -> str:
+        out = self.label("g")
+        if len(cells) == 1:
+            self.chains.append(
+                f"[{cells[0]}]pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color={BG_HEX}[{out}]"
+            )
+        elif len(cells) == 2:
+            self.chains.append(
+                f"[{cells[0]}][{cells[1]}]hstack=inputs=2,"
+                f"pad={W}:{H}:0:(oh-ih)/2:color={BG_HEX}[{out}]"
+            )
+        else:
+            cells = cells[:4] + [self.blank(length, CELL_W, CELL_H) for _ in range(4 - len(cells))]
+            joined = "".join(f"[{c}]" for c in cells)
+            self.chains.append(
+                f"{joined}xstack=inputs=4:layout=0_0|{CELL_W}_0|0_{CELL_H}|{CELL_W}_{CELL_H}[{out}]"
+            )
+        return out
+
+
+def build_browser_track(
+    records: list[dict], run_dir: Path, graph: Graph, begin: float, end: float
+) -> list[str]:
+    """Labels of consecutive segments covering trace time [begin, end]."""
+    marks = main_marks(records, run_dir)
+    windows = parallel_windows(records, run_dir)
+    segments: list[str] = []
+
+    def main_span(a: float, b: float) -> None:
+        if b - a < 0.3 or not marks:
+            return
+        for i, (t, path, opened) in enumerate(marks):
+            stop = marks[i + 1][0] if i + 1 < len(marks) else float("inf")
+            lo, hi = max(a, t if i else a), min(b, stop)
+            if hi - lo >= 0.3:
+                segments.append(graph.clip(path, lo - opened, hi - lo, W, H))
+
+    cursor = begin
+    for start, stop, videos in windows:
+        main_span(cursor, start)
+        length = stop - start
+        cells = [
+            graph.clip(path, start - t_video, length, CELL_W, CELL_H)
+            for _wid, (t_video, path) in sorted(videos.items())
+        ]
+        segments.append(graph.grid(cells, length))
+        cursor = stop
+    main_span(cursor, end)
+    return segments
 
 
 def render_panel(
@@ -286,62 +367,58 @@ def main() -> int:
         return 2
 
     trace_path = args.run_dir / "trace.jsonl"
-    videos = sorted((args.run_dir / "video").glob("*.webm")) + sorted(
-        (args.run_dir / "video").glob("*.mp4")
-    )
-    if not trace_path.exists() or not videos:
-        print(f"need {trace_path} and a recording in {args.run_dir / 'video'}")
+    if not trace_path.exists() or not (args.run_dir / "video").is_dir():
+        print(f"need {trace_path} and a recording in {args.run_dir / 'video'} (--record-video)")
         return 2
 
     records = [
         json.loads(l) for l in trace_path.read_text(encoding="utf-8").splitlines() if l.strip()
     ]
-    offset = next((r["t"] for r in records if r["kind"] == "browser_started"), 0.0)
-    spans = build_timeline(records, args.run_dir)
-    if not spans:
-        biggest = max(videos, key=lambda p: p.stat().st_size)
-        spans = [(0.0, probe(biggest)[0], biggest)]
+    begin = next((r["t"] for r in records if r["kind"] == "page_opened"), 0.0)
+    end = max(r["t"] for r in records) + 1.0
 
-    vh = 900
+    graph = Graph(args.fps)
+    segments = build_browser_track(records, args.run_dir, graph, begin, end)
+    if not segments:
+        print("no usable recording found")
+        return 2
+    total = end - begin
+    grids = len(parallel_windows(records, args.run_dir))
+    print(f"{len(segments)} segment(s), {grids} parallel grid(s), {total:.0f}s of run time")
+
+    speed = "" if args.speed == 1.0 else f",setpts=PTS/{args.speed}"
+    joined = "".join(f"[{s}]" for s in segments)
+    graph.chains.append(
+        f"{joined}concat=n={len(segments)}:v=1:a=0,fps={args.fps}{speed},"
+        f"tpad=stop_mode=clone:stop_duration={args.hold}[b]"
+    )
+
     font = load_font(args.font_size)
     line_h = args.font_size + 5
     cols = max(40, int((args.panel_width - 24) / (args.font_size * 0.6)))
-    rows = max(10, (vh - 44) // line_h)
+    rows = max(10, (H - 44) // line_h)
     lines = trace_to_lines(trace_path, cols)
 
-    trace_end = max(r["t"] for r in records) - offset
-    hold = args.hold
-    spans_seconds = sum(
-        min(stop, probe(path)[0]) - max(0.0, start) for start, stop, path in spans
-    )
-    missing = trace_end - spans_seconds
-    if missing > 1:
-        hold += missing / args.speed
-        print(f"recording is {missing:.0f}s shorter than the run; holding {hold:.0f}s at the end")
-
-    inputs, browser_filter, browser_seconds, _ = browser_stream(
-        spans, args.fps, args.speed, hold
-    )
-    print(
-        f"{len(inputs)} tab recording(s), {len(spans)} visible segment(s), "
-        f"{browser_seconds:.0f}s of footage"
-    )
-
     tmp = Path(tempfile.mkdtemp(prefix="agentvid-"))
-    frames = int((browser_seconds / args.speed + hold) * args.fps)
+    frames = int((total / args.speed + args.hold) * args.fps)
     for i in range(frames):
-        now = i / args.fps * args.speed + offset
-        panel = render_panel(lines, now, (args.panel_width, vh), font, line_h, rows)
-        panel.save(tmp / f"f{i:05d}.png")
-    print(f"rendered {frames} terminal frames at {args.panel_width}x{vh}")
+        now = begin + i / args.fps * args.speed
+        render_panel(lines, now, (args.panel_width, H), font, line_h, rows).save(
+            tmp / f"f{i:05d}.png"
+        )
+    print(f"rendered {frames} terminal frames at {args.panel_width}x{H}")
 
     out = args.output or (args.run_dir / "demo.mp4")
     cmd = ["ffmpeg", "-y", "-framerate", str(args.fps), "-i", str(tmp / "f%05d.png")]
-    for path in inputs:
+    for path in graph.inputs:
         cmd += ["-i", path]
+    script = tmp / "filter.txt"
+    script.write_text(
+        ";".join(graph.chains) + ";[0:v][b]hstack=inputs=2:shortest=1[v]", encoding="utf-8"
+    )
     cmd += [
-        "-filter_complex",
-        f"{browser_filter};[0:v][b]hstack=inputs=2[v]",
+        "-filter_complex_script",
+        str(script),
         "-map",
         "[v]",
         "-c:v",
@@ -350,6 +427,8 @@ def main() -> int:
         "yuv420p",
         "-crf",
         "23",
+        "-movflags",
+        "+faststart",
         str(out),
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -357,7 +436,7 @@ def main() -> int:
         print(result.stderr[-2500:])
         return 1
     shutil.rmtree(tmp, ignore_errors=True)
-    print(f"wrote {out}  ({1440 + args.panel_width}x{vh})")
+    print(f"wrote {out}  ({W + args.panel_width}x{H})")
     return 0
 
 

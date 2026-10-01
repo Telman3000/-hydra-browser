@@ -48,6 +48,8 @@ class _EphemeralSession:
     slow_mo_ms: int = 0
     storage_state_path: Path | None = None
     default_timeout_ms: int = 12_000
+    video_dir: Path | None = None
+    slot: int = 0
 
     _pw: Any = field(default=None, init=False, repr=False)
     _browser: Any = field(default=None, init=False, repr=False)
@@ -68,7 +70,9 @@ class _EphemeralSession:
                 "slow_mo": self.slow_mo_ms,
                 "args": [
                     "--disable-blink-features=AutomationControlled",
-                    "--start-maximized",
+                    # Cascade worker windows so they are all visible next to the main one.
+                    f"--window-position={60 + self.slot * 360},{80 + self.slot * 70}",
+                    "--window-size=1100,760",
                 ],
                 "ignore_default_args": ["--enable-automation"],
             }
@@ -77,6 +81,14 @@ class _EphemeralSession:
                 launch_kwargs["channel"] = channel
             self._browser = self._pw.chromium.launch(**launch_kwargs)
             ctx_kwargs: dict[str, Any] = {"no_viewport": True}
+            if self.video_dir:
+                Path(self.video_dir).mkdir(parents=True, exist_ok=True)
+                ctx_kwargs.update(
+                    no_viewport=False,
+                    viewport={"width": 1280, "height": 800},
+                    record_video_dir=str(self.video_dir),
+                    record_video_size={"width": 1280, "height": 800},
+                )
             if self.storage_state_path and Path(self.storage_state_path).exists():
                 ctx_kwargs["storage_state"] = str(self.storage_state_path)
             self._context = self._browser.new_context(**ctx_kwargs)
@@ -117,7 +129,13 @@ class _EphemeralSession:
         return [p for p in self.context.pages if not p.is_closed()]
 
     def video_path(self) -> str | None:
-        return None
+        page = self.page
+        if page is None or page.video is None:
+            return None
+        try:
+            return page.video.path()
+        except Exception:  # noqa: BLE001
+            return None
 
     def active_page(self):
         if self.page is None or self.page.is_closed():
@@ -262,6 +280,8 @@ def run_worker_agent(
     cfg: AgentConfig,
     run_dir: Path,
     worker_id: int,
+    console: AgentConsole | None = None,
+    trace: Trace | None = None,
 ) -> WorkerResult:
     """Run an action-capable worker in the calling thread with its own Playwright."""
     usage = Usage()
@@ -270,7 +290,10 @@ def run_worker_agent(
         headless=cfg.browser.headless,
         slow_mo_ms=cfg.browser.slow_mo_ms,
         storage_state_path=Path(storage_state_path) if storage_state_path else None,
+        video_dir=(run_dir / "video" / f"w{worker_id}") if cfg.browser.record_video else None,
+        slot=worker_id - 1,
     )
+    prefix = WORKER_PREFIX.format(wid=worker_id)
     # Workers have no human: ask-mode + callback that auto-refuses medium/high.
     safety_cfg = SafetyConfig(mode="ask", use_llm_judge=cfg.safety.use_llm_judge)
     safety = SafetyPolicy(
@@ -283,7 +306,11 @@ def run_worker_agent(
     steps = 0
 
     try:
-        session.start(start_url)
+        session.start()
+        if trace and session.video_path():
+            trace.write("worker_video", worker_id=worker_id, video=session.video_path())
+        if start_url:
+            session.goto(start_url)
         box = Toolbox(
             session,  # type: ignore[arg-type]
             cfg,
@@ -333,7 +360,19 @@ def run_worker_agent(
             results = []
             finished = False
             for call in tool_uses:
-                outcome = box.dispatch(call.name, dict(call.input))
+                args = dict(call.input)
+                if console:
+                    console.tool_call(call.name, args, prefix=prefix)
+                if trace:
+                    trace.write("worker_tool", worker_id=worker_id, tool=call.name, args=args)
+                outcome = box.dispatch(call.name, args)
+                if console and not outcome.terminal:
+                    console.tool_result(
+                        outcome.content if isinstance(outcome.content, str) else "<non-text>",
+                        outcome.is_error,
+                        prefix=prefix,
+                        lines=1,
+                    )
                 if outcome.terminal:
                     report = outcome.report or report
                     status = outcome.status or "completed"
@@ -417,6 +456,8 @@ def run_parallel_workers(
             cfg=cfg,
             run_dir=run_dir,
             worker_id=idx,
+            console=console,
+            trace=trace,
         )
         if trace:
             trace.write(

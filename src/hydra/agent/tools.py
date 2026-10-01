@@ -373,7 +373,10 @@ class Toolbox:
             )
         lines = [f"{len(matches)} match(es) for {query!r}:"]
         for m in matches:
-            lines.append(f'- {m["role"]} "{m["name"]}" [{m["ref"]}]  — context: {m["context"]}')
+            href = f' (href={m["href"]})' if m.get("href") else ""
+            lines.append(
+                f'- {m["role"]} "{m["name"]}"{href} [{m["ref"]}]  — context: {m["context"]}'
+            )
         self._ensure_snapshot()
         return ToolOutcome(untrusted("\n".join(lines)), observation=f"find {query!r}")
 

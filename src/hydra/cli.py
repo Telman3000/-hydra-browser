@@ -87,11 +87,17 @@ def start_demo_server(console: AgentConsole) -> subprocess.Popen | None:
 
 
 def check_credentials(console: AgentConsole) -> bool:
+    provider = (os.getenv("AGENT_PROVIDER") or "anthropic").lower()
+    if provider == "openai":
+        if os.getenv("OPENAI_API_KEY"):
+            return True
+        console.error("No OPENAI_API_KEY found. Set it in .env (see .env.example).")
+        return False
     if os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN"):
         return True
     console.error(
-        "No API credentials found. Set ANTHROPIC_API_KEY, or point ANTHROPIC_BASE_URL + "
-        "ANTHROPIC_AUTH_TOKEN at an Anthropic-compatible endpoint (see .env.example)."
+        "No API credentials found. Set ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, "
+        "or AGENT_PROVIDER=openai + OPENAI_API_KEY (see .env.example)."
     )
     return False
 
@@ -129,7 +135,7 @@ def main(argv: list[str] | None = None) -> int:
     trace.write("browser_started", url=session.active_page().url)
     console.note(
         f"profile {cfg.browser.profile_dir} · safety={cfg.safety.mode} · "
-        f"workers≤{cfg.workers.max_workers} · trace {trace.dir}"
+        f"workers<={cfg.workers.max_workers} · trace {trace.dir}"
     )
     console.note(
         "The browser window is yours too: log in manually if a site needs it, then give "

@@ -87,6 +87,15 @@ def test_high_risk_words_are_caught_even_in_long_labels():
     assert p.assess("browser_click", {"ref": "e1"}, label, "https://shop.test/cart").risk == "high"
 
 
+def test_submitting_a_search_query_is_low_risk():
+    p = policy()
+    for label in ('combobox "Профессия, должность или компания"', 'textbox "Поиск по сайту"'):
+        verdict = p.assess(
+            "browser_type", {"ref": "e1", "text": "python developer", "submit": True}, label, "u"
+        )
+        assert verdict.risk == "low", label
+
+
 def test_text_the_agent_is_about_to_type_is_classified_too():
     p = policy()
     verdict = p.assess(

@@ -15,6 +15,14 @@ def test_snapshot_is_tiny_compared_to_the_html(mail):
     assert "Мяу.Почта" in rendered
 
 
+def test_links_carry_their_destination(session, demo_url):
+    session.goto(f"{demo_url}/index.html")
+    rendered = S.capture(session).render(20_000)
+    assert "href=/mail.html" in rendered
+    found = A.find(session, "Доставка еды")
+    assert any(m.get("href") == "/shop.html" for m in found)
+
+
 def test_delegated_click_handlers_still_get_handles(mail):
     snap = S.capture(mail)
     rows = [n for n in snap.nodes if n.get("role") == "listitem" and n.get("ref")]

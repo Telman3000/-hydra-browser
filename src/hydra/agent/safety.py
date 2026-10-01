@@ -102,7 +102,8 @@ hard it would be for the user to undo it.
 
 Reply with JSON only: {"risk": "none|low|medium|high", "reason": "<=15 words"}
 
-- none/low: navigating, searching, opening, filtering, expanding, adding to a cart.
+- none/low: navigating, searching (including pressing Enter in a search field),
+  opening, filtering, expanding, adding to a cart.
 - medium: deleting or archiving one item, sending a message or application,
   submitting a form, changing a setting, accepting terms.
 - high: paying, ordering, transferring money, deleting an account or a bulk of
@@ -179,6 +180,10 @@ class SafetyPolicy:
             return Verdict("low", "navigation", "rules")
         if tool == "browser_type" and not args.get("submit"):
             return Verdict("low", "typing into a field", "rules")
+        if tool == "browser_type" and (
+            role in ("searchbox", "combobox") or re.search(r"search|поиск|найти|искать", name.lower())
+        ):
+            return Verdict("low", "submitting a search query", "rules")
         if tool == "browser_click" and role == "link" and not args.get("modifiers"):
             return Verdict("low", "following a link", "rules")
 

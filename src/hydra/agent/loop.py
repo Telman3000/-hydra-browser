@@ -240,12 +240,20 @@ class AgentLoop:
 
     def _call_model(self, system: Any, tools: list[dict[str, Any]]) -> Any:
         delay = 20.0
+        rate_errors: tuple[type[BaseException], ...] = (anthropic.RateLimitError,)
+        try:
+            from openai import RateLimitError as OpenAIRateLimitError
+
+            rate_errors = (anthropic.RateLimitError, OpenAIRateLimitError)
+        except ImportError:
+            pass
+
         for attempt in range(4):
             try:
                 return self.llm.create(
                     system=system, messages=self.convo.messages, tools=tools
                 )
-            except anthropic.RateLimitError as exc:
+            except rate_errors as exc:
                 if attempt == 3:
                     raise
                 wait = float(
@@ -280,6 +288,8 @@ class AgentLoop:
                 self.console.thinking(block.thinking)
             elif block.type == "text":
                 self.console.assistant(block.text)
+                if self.trace and block.text.strip():
+                    self.trace.write("assistant", text=block.text.strip()[:2000])
 
     def _execute(
         self, tool_uses: list[Any], step: int

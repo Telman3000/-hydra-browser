@@ -80,6 +80,8 @@ class Snapshot:
                     flags.append(key if v is True else f"{key}={v}")
             if "options" in state:
                 flags.append("options=[" + ", ".join(state["options"][:12]) + "]")
+            if n.get("href"):
+                flags.append(f"href={n['href']}")
             if n.get("offscreen"):
                 flags.append("offscreen")
             if n.get("scrollable"):

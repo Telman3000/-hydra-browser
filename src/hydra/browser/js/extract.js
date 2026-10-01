@@ -187,6 +187,17 @@
     return st;
   }
 
+  /** Where a link goes, short enough to keep: path for same-site, host+path otherwise. */
+  function shortHref(el) {
+    const raw = el.getAttribute('href');
+    if (!raw || raw.startsWith('#') || /^javascript:/i.test(raw)) return '';
+    let u;
+    try { u = new URL(raw, location.href); } catch (e) { return ''; }
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return '';
+    const same = u.host === location.host;
+    return clip((same ? '' : u.host) + u.pathname + u.search, 90);
+  }
+
   function isScrollable(el, style) {
     if (!style) return false;
     const oy = style.overflowY;
@@ -275,6 +286,10 @@
           if (!inView) node.offscreen = true;
           const st = stateOf(el, role);
           if (Object.keys(st).length) node.state = st;
+          if (role === 'link') {
+            const href = shortHref(el);
+            if (href) node.href = href;
+          }
           if (interactive || scrollable) {
             // Stable identity: the same element keeps the same ref across
             // snapshots, which is what makes snapshot-to-snapshot diffs small.
@@ -343,7 +358,7 @@
         (el.getAttribute('value') || '')).toLowerCase();
       if (hay.includes(q)) {
         const role = roleOf(el);
-        out.push({ ref, role, name: accessibleName(el, role), context: clip(el.parentElement ? el.parentElement.innerText : '', 160) });
+        out.push({ ref, role, name: accessibleName(el, role), href: role === 'link' ? shortHref(el) : '', context: clip(el.parentElement ? el.parentElement.innerText : '', 160) });
         seen.add(el);
         if (out.length >= (limit || 20)) return { matches: out, truncated: true };
       }
@@ -368,7 +383,7 @@
         window.__agent.byEl.set(actionable, ref);
       }
       const role = roleOf(actionable);
-      out.push({ ref, role, name: accessibleName(actionable, role), context: clip(el.innerText || el.textContent, 160) });
+      out.push({ ref, role, name: accessibleName(actionable, role), href: role === 'link' ? shortHref(actionable) : '', context: clip(el.innerText || el.textContent, 160) });
       if (out.length >= (limit || 20)) return { matches: out, truncated: true };
     }
     return { matches: out };
